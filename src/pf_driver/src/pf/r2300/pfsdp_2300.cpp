@@ -1,11 +1,21 @@
-#include "pf_driver/pf/r2300/pfsdp_2300.h"
+#include <cmath>
 
+#include "pf_driver/pf/r2300/pfsdp_2300.h"
 #include "pf_driver/pf/parser_utils.h"
 
-PFSDP_2300::PFSDP_2300(std::shared_ptr<HandleInfo> info, std::shared_ptr<ScanConfig> config,
-                       std::shared_ptr<ScanParameters> params)
-  : PFSDPBase(info, config, params)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+PFSDP_2300::PFSDP_2300(std::shared_ptr<rclcpp::Node> node, std::shared_ptr<HandleInfo> info,
+                       std::shared_ptr<ScanConfig> config, std::shared_ptr<ScanParameters> params)
+  : PFSDPBase(node, info, config, params)
 {
+  node_ = node;
+  declare_specific_parameters();
+
+  parameters_handle_ =
+      node_->add_on_set_parameters_callback(std::bind(&PFSDP_2300::reconfig_callback, this, std::placeholders::_1));
 }
 
 std::string PFSDP_2300::get_product()
@@ -33,13 +43,6 @@ void PFSDP_2300::get_scan_parameters()
   params_->scan_freq = parser_utils::to_float(resp["scan_frequency"]);
 }
 
-void PFSDP_2300::setup_param_server()
-{
-  param_server_R2300_ = std::make_unique<dynamic_reconfigure::Server<pf_driver::PFDriverR2300Config>>();
-  param_server_R2300_->setCallback(
-      boost::bind(&PFSDP_2300::reconfig_callback, this, boost::placeholders::_1, boost::placeholders::_2));
-}
-
 void PFSDP_2300::get_layers_enabled(uint16_t& enabled, uint16_t& highest)
 {
   enabled = 0;
@@ -50,7 +53,7 @@ void PFSDP_2300::get_layers_enabled(uint16_t& enabled, uint16_t& highest)
   {
     if (vals[i].compare("on") == 0)
     {
-      enabled += pow(2, i);
+      enabled += std::pow(2, i);
       highest = i;
     }
   }
@@ -72,96 +75,57 @@ std::string PFSDP_2300::get_start_angle_str()
   return std::string("start_angle");
 }
 
-void PFSDP_2300::reconfig_callback(pf_driver::PFDriverR2300Config& config, uint32_t level)
+void PFSDP_2300::declare_specific_parameters()
 {
-  if (level == 1)
+  float measure_start_angle, measure_stop_angle, pilot_start_angle, pilot_stop_angle;
+  std::string layer_enable;
+  bool pilot_laser;
+
+  if (!node_->has_parameter("measure_start_angle"))
   {
-    set_parameter({ KV("ip_mode", config.ip_mode) });
+    node_->declare_parameter("measure_start_angle", measure_start_angle);
   }
-  else if (level == 2)
+  if (!node_->has_parameter("measure_stop_angle"))
   {
-    set_parameter({ KV("ip_address", config.ip_address) });
+    node_->declare_parameter("measure_stop_angle", measure_stop_angle);
   }
-  else if (level == 3)
+  if (!node_->has_parameter("pilot_start_angle"))
   {
-    set_parameter({ KV("subnet_mask", config.subnet_mask) });
+    node_->declare_parameter("pilot_start_angle", pilot_start_angle);
   }
-  else if (level == 4)
+  if (!node_->has_parameter("pilot_stop_angle"))
   {
-    set_parameter({ KV("gateway", config.gateway) });
+    node_->declare_parameter("pilot_stop_angle", pilot_stop_angle);
   }
-  else if (level == 5)
+  if (!node_->has_parameter("layer_enable"))
   {
-    set_parameter({ KV("user_tag", config.user_tag) });
+    node_->declare_parameter("layer_enable", layer_enable);
   }
-  else if (level == 6)
+  if (!node_->has_parameter("pilot_laser"))
   {
-    set_parameter({ KV("layer_enable", config.layer_enable) });
+    node_->declare_parameter("pilot_laser", pilot_laser);
   }
-  else if (level == 7)
+}
+
+bool PFSDP_2300::reconfig_callback_impl(const std::vector<rclcpp::Parameter>& parameters)
+{
+  bool successful = PFSDPBase::reconfig_callback_impl(parameters);
+
+  for (const auto& parameter : parameters)
   {
-    set_parameter({ KV("scan_frequency", config.scan_frequency) });
+    std::cout << parameter.get_name() << " " << parameter.value_to_string() << std::endl;
+    if (parameter.get_name() == "measure_start_angle" || parameter.get_name() == "measure_stop_angle" ||
+        parameter.get_name() == "pilot_start_angle" || parameter.get_name() == "pilot_stop_angle" ||
+        parameter.get_name() == "layer_enable")
+    {
+      std::cout << parameter.get_name() << " " << parameter.value_to_string() << std::endl;
+      return set_parameter({ KV(parameter.get_name(), parameter.value_to_string()) });
+    }
+    else if (parameter.get_name() == "pilot_laser")
+    {
+      return set_parameter({ KV(parameter.get_name(), parameter.as_bool() ? "on" : "off") });
+    }
   }
-  else if (level == 8)
-  {
-    set_parameter({ KV("scan_direction", config.scan_direction) });
-  }
-  else if (level == 9)
-  {
-    set_parameter({ KV("measure_start_angle", config.measure_start_angle) });
-  }
-  else if (level == 10)
-  {
-    set_parameter({ KV("measure_stop_angle", config.measure_stop_angle) });
-  }
-  else if (level == 11)
-  {
-    set_parameter({ KV("locator_indication", config.locator_indication) });
-  }
-  else if (level == 12)
-  {
-    set_parameter({ KV("pilot_laser", config.pilot_laser) });
-  }
-  else if (level == 13)
-  {
-    set_parameter({ KV("pilot_start_angle", config.pilot_start_angle) });
-  }
-  else if (level == 14)
-  {
-    set_parameter({ KV("pilot_stop_angle", config.pilot_stop_angle) });
-  }
-  else if (level == 15)
-  {
-    set_parameter({ KV("operating_mode", config.operating_mode) });
-  }
-  else if (level == 18)
-  {
-    config_->packet_type = config.packet_type;
-  }
-  else if (level == 19)
-  {
-    // currently always none for R2300
-    // config_->packet_crc = config.packet_crc;
-  }
-  else if (level == 20)
-  {
-    config_->watchdog = (config.watchdog == "on") ? true : false;
-  }
-  else if (level == 21)
-  {
-    config_->watchdogtimeout = config.watchdogtimeout;
-  }
-  else if (level == 22)
-  {
-    config_->start_angle = config.start_angle;
-  }
-  else if (level == 23)
-  {
-    config_->max_num_points_scan = config.max_num_points_scan;
-  }
-  else if (level == 24)
-  {
-    config_->skip_scans = config.skip_scans;
-  }
-  update_scanoutput_config();
+
+  return successful;
 }

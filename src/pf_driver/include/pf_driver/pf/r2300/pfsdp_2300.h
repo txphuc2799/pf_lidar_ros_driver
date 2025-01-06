@@ -1,14 +1,11 @@
 #pragma once
 
-#include <dynamic_reconfigure/server.h>
-
 #include "pf_driver/pf/pfsdp_base.h"
-#include "pf_driver/PFDriverR2300Config.h"
 
 class PFSDP_2300 : public PFSDPBase
 {
 public:
-  PFSDP_2300(std::shared_ptr<HandleInfo> info, std::shared_ptr<ScanConfig> config,
+  PFSDP_2300(std::shared_ptr<rclcpp::Node> node, std::shared_ptr<HandleInfo> info, std::shared_ptr<ScanConfig> config,
              std::shared_ptr<ScanParameters> params);
 
   virtual std::string get_product();
@@ -20,13 +17,15 @@ public:
   void setup_param_server();
 
 private:
+  std::shared_ptr<rclcpp::Node> node_;
+
   void get_layers_enabled(uint16_t& enabled, uint16_t& highest);
 
   virtual std::pair<float, float> get_angle_start_stop(int start_angle);
 
   virtual std::string get_start_angle_str();
 
-  void reconfig_callback(pf_driver::PFDriverR2300Config& config, uint32_t level);
+  virtual bool reconfig_callback_impl(const std::vector<rclcpp::Parameter>& parameters) override;
 
-  std::unique_ptr<dynamic_reconfigure::Server<pf_driver::PFDriverR2300Config>> param_server_R2300_;
+  virtual void declare_specific_parameters() override;
 };

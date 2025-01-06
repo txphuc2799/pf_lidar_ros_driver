@@ -1,11 +1,14 @@
 #include <iostream>
 
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
+#include <rcl_interfaces/msg/integer_range.hpp>
+
 #include "pf_driver/pf/pfsdp_base.h"
 #include "pf_driver/pf/parser_utils.h"
 
-PFSDPBase::PFSDPBase(std::shared_ptr<HandleInfo> info, std::shared_ptr<ScanConfig> config,
-                     std::shared_ptr<ScanParameters> params)
-  : http_interface(new HTTPInterface(info->hostname, "cmd")), info_(info), config_(config), params_(params)
+PFSDPBase::PFSDPBase(std::shared_ptr<rclcpp::Node> node, std::shared_ptr<HandleInfo> info,
+                     std::shared_ptr<ScanConfig> config, std::shared_ptr<ScanParameters> params)
+  : http_interface(new HTTPInterface(info->hostname, "cmd")), node_(node), info_(info), config_(config), params_(params)
 {
 }
 
@@ -292,6 +295,89 @@ void PFSDPBase::get_scan_parameters()
 {
 }
 
-void PFSDPBase::setup_param_server()
+// handle "dynamic" parameters
+
+rcl_interfaces::msg::SetParametersResult PFSDPBase::reconfig_callback(const std::vector<rclcpp::Parameter>& parameters)
 {
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = reconfig_callback_impl(parameters);
+
+  if (result.successful)
+  {
+    update_scanoutput_config();
+  }
+
+  return result;
+}
+
+bool PFSDPBase::reconfig_callback_impl(const std::vector<rclcpp::Parameter>& parameters)
+{
+  bool successful = true;
+
+  for (const auto& parameter : parameters)
+  {
+    if (parameter.get_name() == "ip_mode" || parameter.get_name() == "scan_frequency" ||
+        parameter.get_name() == "subnet_mask" || parameter.get_name() == "gateway" ||
+        parameter.get_name() == "scan_direction" || parameter.get_name() == "user_tag" ||
+        parameter.get_name() == "ip_address" || parameter.get_name() == "subnet_mask" ||
+        parameter.get_name() == "gateway")
+    {
+      return set_parameter({ KV(parameter.get_name(), parameter.value_to_string()) });
+    }
+    else if (parameter.get_name() == "ip_address")
+    {
+      info_->hostname = parameter.as_string();
+      return set_parameter({ KV(parameter.get_name(), parameter.value_to_string()) });
+    }
+    else if (parameter.get_name() == "packet_crc")
+    {
+      return set_parameter({ KV(parameter.get_name(), parameter.as_int()) });
+    }
+    else if (parameter.get_name() == "port")
+    {
+      info_->port = parameter.value_to_string();
+    }
+    else if (parameter.get_name() == "transport")
+    {
+      // selecting TCP as default if not UDP
+      std::string transport_str = parameter.as_string();
+      info_->handle_type = transport_str == "udp" ? HandleInfo::HANDLE_TYPE_UDP : HandleInfo::HANDLE_TYPE_TCP;
+    }
+    else if (parameter.get_name() == "watchdog")
+    {
+      config_->watchdog = parameter.as_bool();
+    }
+    else if (parameter.get_name() == "watchdogtimeout")
+    {
+      config_->watchdogtimeout = parameter.as_int();
+    }
+    else if (parameter.get_name() == "start_angle")
+    {
+      config_->start_angle = parameter.as_double();
+    }
+    else if (parameter.get_name() == "max_num_points_scan")
+    {
+      config_->max_num_points_scan = parameter.as_int();
+    }
+    else if (parameter.get_name() == "skip_scans")
+    {
+      config_->skip_scans = parameter.as_int();
+    }
+    else if (parameter.get_name() == "locator_indication")
+    {
+      return set_parameter({ KV(parameter.get_name(), parameter.as_bool() ? "on" : "off") });
+    }
+  }
+
+  return successful;
+}
+
+void PFSDPBase::declare_common_parameters()
+{
+}
+
+void PFSDPBase::setup_parameters_callback()
+{
+  parameters_handle_ =
+      node_->add_on_set_parameters_callback(std::bind(&PFSDPBase::reconfig_callback, this, std::placeholders::_1));
 }

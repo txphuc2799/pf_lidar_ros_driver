@@ -3,13 +3,14 @@
 #include <string>
 #include <utility>
 
+#include <rcutils/logging.h>
 #include "pf_driver/pf/pf_interface.h"
 #include "pf_driver/ros/laser_scan_publisher.h"
 #include "pf_driver/ros/point_cloud_publisher.h"
 #include "pf_driver/communication/udp_transport.h"
 #include "pf_driver/communication/tcp_transport.h"
 
-PFInterface::PFInterface() : state_(PFState::UNINIT)
+PFInterface::PFInterface(std::shared_ptr<rclcpp::Node> node) : node_(node), state_(PFState::UNINIT)
 {
 }
 
@@ -25,27 +26,27 @@ bool PFInterface::init(std::shared_ptr<HandleInfo> info, std::shared_ptr<ScanCon
   frame_id_ = frame_id;
   num_layers_ = num_layers;
 
-  protocol_interface_ = std::make_shared<PFSDPBase>(info, config, params);
+  protocol_interface_ = std::make_shared<PFSDPBase>(node_, info, config, params);
   // This is the first time ROS communicates with the device
   auto opi = protocol_interface_->get_protocol_info();
   if (opi.isError)
   {
-    ROS_ERROR("Unable to communicate with device. Please check the IP address");
+    RCLCPP_ERROR(node_->get_logger(), "Unable to communicate with device. Please check the IP address");
     return false;
   }
 
   if (opi.protocol_name != "pfsdp")
   {
-    ROS_ERROR("Incorrect protocol");
+    RCLCPP_ERROR(node_->get_logger(), "Incorrect protocol");
     return false;
   }
 
   if (!handle_version(opi.version_major, opi.version_minor, opi.device_family, topic, frame_id, num_layers))
   {
-    ROS_ERROR("Device unsupported");
+    RCLCPP_ERROR(node_->get_logger(), "Device unsupported");
     return false;
   }
-  ROS_INFO("Device found: %s", product_.c_str());
+  RCLCPP_INFO(node_->get_logger(), "Device found: %s", product_.c_str());
 
   // release previous handles
   if (!prev_handle_.empty())
@@ -55,15 +56,15 @@ bool PFInterface::init(std::shared_ptr<HandleInfo> info, std::shared_ptr<ScanCon
 
   if (info->handle_type == HandleInfo::HANDLE_TYPE_UDP)
   {
-    transport_ = std::make_unique<UDPTransport>(info->hostname, info->port);
+    transport_ = std::make_unique<UDPTransport>(info->hostname);
     if (!transport_->connect())
     {
-      ROS_ERROR("Unable to establish UDP connection");
+      RCLCPP_ERROR(node_->get_logger(), "Unable to establish UDP connection");
       return false;
     }
 
-    info_->endpoint = transport_->get_host_ip();
-    info_->port = transport_->get_port();
+    info->endpoint = transport_->get_host_ip();
+    info->port = transport_->get_port();
     protocol_interface_->request_handle_udp();
   }
   else if (info->handle_type == HandleInfo::HANDLE_TYPE_TCP)
@@ -75,27 +76,26 @@ bool PFInterface::init(std::shared_ptr<HandleInfo> info, std::shared_ptr<ScanCon
     transport_->set_port(info_->port);
     if (!transport_->connect())
     {
-      ROS_ERROR("Unable to establish TCP connection");
+      RCLCPP_ERROR(node_->get_logger(), "Unable to establish TCP connection");
       return false;
     }
   }
   else
   {
-    ROS_ERROR("Incorrect transport option");
+    RCLCPP_ERROR(node_->get_logger(), "Incorrect transport option");
     return false;
   }
 
-  if (info_->handle.empty())
+  if (info->handle.empty())
   {
-    ROS_ERROR("Could not acquire communication handle");
+    RCLCPP_ERROR(node_->get_logger(), "Could not acquire communication handle");
     return false;
   }
 
   prev_handle_ = info_->handle;
-
-  protocol_interface_->setup_param_server();
+  protocol_interface_->setup_parameters_callback();
+  protocol_interface_->update_scanoutput_config();
   protocol_interface_->set_connection_failure_cb(std::bind(&PFInterface::connection_failure_cb, this));
-  //   protocol_interface_->update_scanoutput_config();
   change_state(PFState::INIT);
   return true;
 }
@@ -117,7 +117,7 @@ void PFInterface::change_state(PFState state)
     text = "Shutdown";
   if (state_ == PFState::ERROR)
     text = "Error";
-  ROS_INFO("Device state changed to %s", text.c_str());
+  RCLCPP_INFO(node_->get_logger(), "Device state changed to %s", text.c_str());
 }
 
 bool PFInterface::can_change_state(PFState state)
@@ -139,9 +139,12 @@ bool PFInterface::start_transmission(std::shared_ptr<std::mutex> net_mtx,
     return false;
 
   protocol_interface_->start_scanoutput();
-  if (config_->watchdog)
+  // start watchdog timer is watchdog is true in config AND if the device is not R2000
+  // since watchdog for R2300 is always off
+  if (config_->watchdog && protocol_interface_->get_product().find("R2000") != std::string::npos)
+  {
     start_watchdog_timer(config_->watchdogtimeout / 1000.0);
-
+  }
   change_state(PFState::RUNNING);
   return true;
 }
@@ -153,7 +156,6 @@ void PFInterface::stop_transmission()
     return;
   protocol_interface_->stop_scanoutput(info_->handle);
   protocol_interface_->release_handle(info_->handle);
-
   change_state(PFState::INIT);
 }
 
@@ -161,9 +163,13 @@ void PFInterface::terminate()
 {
   if (!pipeline_)
     return;
-  watchdog_timer_.stop();
-  pipeline_->terminate();
 
+  if (config_->watchdog)
+  {
+    watchdog_timer_->cancel();
+  }
+
+  pipeline_->terminate();
   pipeline_.reset();
   protocol_interface_.reset();
   transport_.reset();
@@ -178,19 +184,20 @@ bool PFInterface::init()
 void PFInterface::start_watchdog_timer(float duration)
 {
   // dividing the watchdogtimeout by 2 to have a “safe” feed time within the defined timeout
-  float feed_time = std::min(duration, 60.0f) / 2.0f;
+  float feed_time_sec = std::min(duration, 60.0f) / 2.0f;
+  int feed_time = feed_time_sec * 1000;
   watchdog_timer_ =
-      nh_.createTimer(ros::Duration(feed_time), std::bind(&PFInterface::feed_watchdog, this, std::placeholders::_1));
+      node_->create_wall_timer(std::chrono::milliseconds(feed_time), std::bind(&PFInterface::feed_watchdog, this));
 }
 
-void PFInterface::feed_watchdog(const ros::TimerEvent& e)
+void PFInterface::feed_watchdog()
 {
   protocol_interface_->feed_watchdog(info_->handle);
 }
 
 void PFInterface::on_shutdown()
 {
-  ROS_INFO("Shutting down pipeline!");
+  RCLCPP_INFO(node_->get_logger(), "Shutting down pipeline!");
   // stop_transmission();
 }
 
@@ -214,25 +221,25 @@ bool PFInterface::handle_version(int major_version, int minor_version, int devic
   if (device_family == 1 || device_family == 3 || device_family == 6)
   {
     expected_dev = "R2000";
-    protocol_interface_ = std::make_shared<PFSDP_2000>(info_, config_, params_);
-    reader_ =
-        std::shared_ptr<PFPacketReader>(new LaserscanPublisher(config_, params_, topic.c_str(), frame_id.c_str()));
+    protocol_interface_ = std::make_shared<PFSDP_2000>(node_, info_, config_, params_);
+    reader_ = std::shared_ptr<PFPacketReader>(
+        new LaserscanPublisher(node_, config_, params_, topic.c_str(), frame_id.c_str()));
   }
   else if (device_family == 5 || device_family == 7)
   {
     expected_dev = "R2300";
-    protocol_interface_ = std::make_shared<PFSDP_2300>(info_, config_, params_);
+    protocol_interface_ = std::make_shared<PFSDP_2300>(node_, info_, config_, params_);
 
     if (device_family == 5)
     {
       std::string part = protocol_interface_->get_part();
       reader_ = std::shared_ptr<PFPacketReader>(
-          new PointcloudPublisher(config_, params_, topic.c_str(), frame_id.c_str(), num_layers, part.c_str()));
+          new PointcloudPublisher(node_, config_, params_, topic.c_str(), frame_id.c_str(), num_layers, part.c_str()));
     }
     else if (device_family == 7)
     {
-      reader_ =
-          std::shared_ptr<PFPacketReader>(new LaserscanPublisher(config_, params_, topic.c_str(), frame_id.c_str()));
+      reader_ = std::shared_ptr<PFPacketReader>(
+          new LaserscanPublisher(node_, config_, params_, topic.c_str(), frame_id.c_str()));
     }
     else
     {
@@ -259,7 +266,7 @@ std::unique_ptr<Pipeline> PFInterface::get_pipeline(const std::string& packet_ty
   std::shared_ptr<Writer<PFPacket>> writer;
   if (product_ == "R2000")
   {
-    ROS_DEBUG("PacketType is: %s", packet_type.c_str());
+    RCLCPP_DEBUG(node_->get_logger(), "PacketType is: %s", packet_type.c_str());
     if (packet_type == "A")
     {
       parser = std::unique_ptr<Parser<PFPacket>>(new PFR2000_A_Parser);
@@ -284,7 +291,8 @@ std::unique_ptr<Pipeline> PFInterface::get_pipeline(const std::string& packet_ty
   {
     return nullptr;
   }
-  writer = std::shared_ptr<Writer<PFPacket>>(new PFWriter<PFPacket>(std::move(transport_), parser));
+  writer =
+      std::shared_ptr<Writer<PFPacket>>(new PFWriter<PFPacket>(std::move(transport_), parser, node_->get_logger()));
   return std::make_unique<Pipeline>(writer, reader_, std::bind(&PFInterface::connection_failure_cb, this), net_mtx,
                                     net_cv, net_fail);
 }

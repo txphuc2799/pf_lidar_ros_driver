@@ -1,29 +1,39 @@
-#include <sensor_msgs/PointCloud2.h>
+#include <ament_index_cpp/get_package_share_directory.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <pcl_conversions/pcl_conversions.h>
+#include <yaml-cpp/yaml.h>
 
-#include "pf_driver/PFR2300Header.h"
+#include "pf_interfaces/msg/pfr2300_header.hpp"
 #include "pf_driver/ros/point_cloud_publisher.h"
 
-PointcloudPublisher::PointcloudPublisher(std::shared_ptr<ScanConfig> config, std::shared_ptr<ScanParameters> params,
-                                         const std::string& scan_topic, const std::string& frame_id,
-                                         const uint16_t num_layers, const std::string& part)
-  : PFDataPublisher(config, params), layer_prev_(-1)
+PointcloudPublisher::PointcloudPublisher(std::shared_ptr<rclcpp::Node> node, std::shared_ptr<ScanConfig> config,
+                                         std::shared_ptr<ScanParameters> params, const std::string& scan_topic,
+                                         const std::string& frame_id, const uint16_t num_layers,
+                                         const std::string& part)
+  : PFDataPublisher(config, params), node_(node), layer_prev_(-1)
 {
-  ros::NodeHandle p_nh("~/");
+  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(node_->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+  tf_static_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(node_);
 
-  XmlRpc::XmlRpcValue angles_param;
-  p_nh.getParam("correction_params", angles_param);
+  // ROS 2 does not supported mixed type nested params at the momemt
+  // Parsing the config YAML file directly
+  std::string correction_params_file = ament_index_cpp::get_package_share_directory("pf_driver") + "/config/"
+                                                                                                   "correction_params."
+                                                                                                   "yaml";
+
+  YAML::Node angles_param_yaml = YAML::LoadFile(correction_params_file);
+  auto angles_param = angles_param_yaml["correction_params"];
 
   angles_.resize(num_layers);
 
   for (size_t i = 0; i < angles_param.size(); i++)
   {
-    angles_[i] = angles_param[i]["ang"];
-    auto coeff_param = angles_param[i]["coeff"];
+    angles_[i] = angles_param[i]["ang"].as<int>();
     std::vector<double> coeffs;
-    for (size_t j = 0; j < coeff_param.size(); j++)
+    for (auto c : angles_param[i]["coeff"])
     {
-      coeffs.push_back(coeff_param[j]);
+      coeffs.push_back(c.as<double>());
     }
 
     correction_params_[angles_[i]] = coeffs;
@@ -37,28 +47,28 @@ PointcloudPublisher::PointcloudPublisher(std::shared_ptr<ScanConfig> config, std
     // init frames for each layer
     publish_static_transform(frame_id, id, angles_[i]);
 
-    scan_publishers_.push_back(p_nh.advertise<sensor_msgs::LaserScan>(topic.c_str(), 100));
+    scan_publishers_.push_back(node_->create_publisher<sensor_msgs::msg::LaserScan>(topic.c_str(), 100));
     frame_ids_.push_back(id);
   }
 
-  cloud_.reset(new sensor_msgs::PointCloud2());
-  pcl_publisher_ = nh_.advertise<sensor_msgs::PointCloud2>(scan_topic, 1);
-  header_publisher_ = nh_.advertise<pf_driver::PFR2300Header>("/r2300_header", 1);
+  cloud_.reset(new sensor_msgs::msg::PointCloud2());
+  pcl_publisher_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(scan_topic, 1);
+  header_publisher_ = node_->create_publisher<pf_interfaces::msg::PFR2300Header>("/r2300_header", 1);
   frame_id_.assign(frame_id);
 }
 
 void PointcloudPublisher::resetCurrentScans()
 {
-  cloud_.reset(new sensor_msgs::PointCloud2());
+  cloud_.reset(new sensor_msgs::msg::PointCloud2());
   layer_prev_ = -1;
 }
 
 void PointcloudPublisher::publish_static_transform(const std::string& parent, const std::string& child,
                                                    int inclination_angle)
 {
-  geometry_msgs::TransformStamped transform;
+  geometry_msgs::msg::TransformStamped transform;
 
-  transform.header.stamp = ros::Time::now();
+  transform.header.stamp = node_->now();
   transform.header.frame_id = parent.c_str();
   transform.child_frame_id = child.c_str();
   transform.transform.translation.x = 0;
@@ -73,21 +83,26 @@ void PointcloudPublisher::publish_static_transform(const std::string& parent, co
   transform.transform.rotation.z = quat.z();
   transform.transform.rotation.w = quat.w();
 
-  static_broadcaster_.sendTransform(transform);
+  tf_static_broadcaster_->sendTransform(transform);
 }
 
-void PointcloudPublisher::publish_scan(sensor_msgs::LaserScanPtr msg, uint16_t idx)
+void PointcloudPublisher::publish_header(pf_interfaces::msg::PFR2300Header& header)
+{
+  header_publisher_->publish(header);
+}
+
+void PointcloudPublisher::publish_scan(sensor_msgs::msg::LaserScan::SharedPtr msg, uint16_t idx)
 {
   msg->header.frame_id = frame_ids_.at(idx);
-  scan_publishers_.at(idx).publish(msg);
+  scan_publishers_.at(idx)->publish(*msg);
 }
 
-void PointcloudPublisher::handle_scan(sensor_msgs::LaserScanPtr msg, uint16_t layer_idx, int layer_inclination,
-                                      bool apply_correction)
+void PointcloudPublisher::handle_scan(sensor_msgs::msg::LaserScan::SharedPtr msg, uint16_t layer_idx,
+                                      int layer_inclination, bool apply_correction)
 {
   publish_scan(msg, layer_idx);
 
-  sensor_msgs::PointCloud2 c;
+  sensor_msgs::msg::PointCloud2 c;
   int channelOptions = laser_geometry::channel_option::Intensity;
   if (apply_correction)
   {
@@ -99,7 +114,7 @@ void PointcloudPublisher::handle_scan(sensor_msgs::LaserScanPtr msg, uint16_t la
   }
   else
   {
-    projector_.transformLaserScanToPointCloud(frame_id_, *msg, c, tfListener_, -1.0, channelOptions);
+    projector_.transformLaserScanToPointCloud(frame_id_, *msg, c, *tf_buffer_, -1.0, channelOptions);
   }
 
   if (layer_idx <= layer_prev_)
@@ -107,8 +122,8 @@ void PointcloudPublisher::handle_scan(sensor_msgs::LaserScanPtr msg, uint16_t la
     if (!cloud_->data.empty())
     {
       cloud_->header.frame_id = frame_id_;
-      pcl_publisher_.publish(cloud_);
-      cloud_.reset(new sensor_msgs::PointCloud2());
+      pcl_publisher_->publish(*cloud_);
+      cloud_.reset(new sensor_msgs::msg::PointCloud2());
     }
     copy_pointcloud(*cloud_, c);
   }
@@ -119,7 +134,7 @@ void PointcloudPublisher::handle_scan(sensor_msgs::LaserScanPtr msg, uint16_t la
   layer_prev_ = layer_idx;
 }
 
-void PointcloudPublisher::copy_pointcloud(sensor_msgs::PointCloud2& c1, sensor_msgs::PointCloud2 c2)
+void PointcloudPublisher::copy_pointcloud(sensor_msgs::msg::PointCloud2& c1, sensor_msgs::msg::PointCloud2 c2)
 {
   c1.header.frame_id = c2.header.frame_id;
   c1.height = c2.height;
@@ -132,7 +147,7 @@ void PointcloudPublisher::copy_pointcloud(sensor_msgs::PointCloud2& c1, sensor_m
   c1.data = std::move(c2.data);
 }
 
-void PointcloudPublisher::add_pointcloud(sensor_msgs::PointCloud2& c1, sensor_msgs::PointCloud2 c2)
+void PointcloudPublisher::add_pointcloud(sensor_msgs::msg::PointCloud2& c1, sensor_msgs::msg::PointCloud2 c2)
 {
   pcl::PCLPointCloud2 p1, p2;
   pcl_conversions::toPCL(c1, p1);
@@ -149,7 +164,7 @@ void PointcloudPublisher::add_pointcloud(sensor_msgs::PointCloud2& c1, sensor_ms
   pcl::toROSMsg(*p1_cloud.get(), c1);
 }
 
-void PointcloudPublisher::project_laser(sensor_msgs::PointCloud2& c, sensor_msgs::LaserScanPtr msg,
+void PointcloudPublisher::project_laser(sensor_msgs::msg::PointCloud2& c, sensor_msgs::msg::LaserScan::SharedPtr msg,
                                         const int layer_inclination)
 {
   pcl::PCLPointCloud2 p;

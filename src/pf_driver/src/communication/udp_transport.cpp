@@ -1,13 +1,18 @@
 #include <iostream>
 
+#include <rclcpp/logging.hpp>
+#include <rclcpp/rclcpp.hpp>
+
 #include "pf_driver/communication/udp_transport.h"
 
 using boost::asio::ip::udp;
 
+auto udp_logger = rclcpp::get_logger("transport");
+
 UDPTransport::UDPTransport(std::string address, std::string port) : Transport(address, transport_type::udp)
 {
   io_service_ = std::make_shared<boost::asio::io_service>();
-  udp::endpoint local_endpoint = local_endpoint = udp::endpoint(udp::v4(), stoi(port));
+  udp::endpoint local_endpoint = udp::endpoint(boost::asio::ip::address_v4::from_string("0.0.0.0"), stoi(port));
 
   socket_ = std::make_unique<udp::socket>(*io_service_, local_endpoint);
   timer_ = std::make_shared<boost::asio::deadline_timer>(*io_service_.get());
@@ -55,7 +60,7 @@ bool UDPTransport::readWithTimeout(boost::array<uint8_t, 4096>& buf, size_t& len
     timer_result_.reset(error);
     if (error.message() == "Success")
     {
-      std::cout << "Time out: No packets received in " << expiry_time << " seconds" << std::endl;
+      RCLCPP_ERROR_STREAM(udp_logger, "Time out: No packets received in " << expiry_time << " seconds");
     }
   });
 
